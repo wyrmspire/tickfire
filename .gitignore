@@ -27,10 +27,20 @@ data/rawprice/
 # Ignore most generated output, but allow the bars and bars_indicators
 # folders to be tracked (negations below re-include them).
 out/*
+# Re-include only two days of bars and indicators (keep all other out/ files ignored)
 !out/bars/
-!out/bars/**
+out/bars/*
+!out/bars/20250424/
+!out/bars/20250424/**
+!out/bars/20250425/
+!out/bars/20250425/**
+
 !out/bars_indicators/
-!out/bars_indicators/**
+out/bars_indicators/*
+!out/bars_indicators/20250424/
+!out/bars_indicators/20250424/**
+!out/bars_indicators/20250425/
+!out/bars_indicators/20250425/**
 
 runs/
 
