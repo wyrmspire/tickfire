@@ -6,10 +6,10 @@ Iterates over a set of configurations and runs experiments.
 
 from pathlib import Path
 from datetime import datetime
-import itertools
 import json
 
 from lab.engine.run_experiment import ExperimentConfig, run_experiment
+from lab.engine.plot_results import plot_model_result
 
 
 def run_sweep():
@@ -17,45 +17,49 @@ def run_sweep():
     sweep_id = f"sweep_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     base_dir = Path("runs") / "sweeps" / sweep_id
     
-    # Hyperparameters to sweep
-    hidden_sizes = [32, 64]
-    num_layers_list = [1, 2]
-    windows = [128, 256]
+    # 5 Specific Configurations
+    configs = [
+        {"hidden_size": 32, "num_layers": 1, "window": 128},
+        {"hidden_size": 32, "num_layers": 2, "window": 128},
+        {"hidden_size": 64, "num_layers": 1, "window": 256},
+        {"hidden_size": 64, "num_layers": 2, "window": 256},
+        {"hidden_size": 128, "num_layers": 2, "window": 256},
+    ]
     
-    # Generate all combinations
-    combinations = list(itertools.product(hidden_sizes, num_layers_list, windows))
-    
-    print(f"Starting sweep {sweep_id} with {len(combinations)} configurations.")
+    print(f"Starting sweep {sweep_id} with {len(configs)} configurations.")
     
     results = []
     
-    for i, (hidden_size, num_layers, window) in enumerate(combinations):
-        exp_name = f"exp_{i:03d}_h{hidden_size}_l{num_layers}_w{window}"
+    for i, params in enumerate(configs):
+        exp_name = f"model_{i+1}_h{params['hidden_size']}_l{params['num_layers']}_w{params['window']}"
         print(f"Running {exp_name}...")
         
         cfg = ExperimentConfig(
             name=exp_name,
             sweep_id=sweep_id,
             out_dir=base_dir / exp_name,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            window=window,
-            epochs=5, # Keep it short for demo
+            hidden_size=params['hidden_size'],
+            num_layers=params['num_layers'],
+            window=params['window'],
+            epochs=5, # Short run for demo
         )
         
         try:
             status = run_experiment(cfg)
+            
+            # Plot results
+            print(f"Generating chart for {exp_name}...")
+            plot_model_result(cfg.out_dir)
             
             # Extract key metrics
             best_loss = status.get("training", {}).get("best_val_loss", float("inf"))
             
             results.append({
                 "name": exp_name,
-                "hidden_size": hidden_size,
-                "num_layers": num_layers,
-                "window": window,
+                "params": params,
                 "best_val_loss": best_loss,
-                "status": "success"
+                "status": "success",
+                "chart_path": str(cfg.out_dir / "chart.png")
             })
             
         except Exception as e:
@@ -75,11 +79,11 @@ def run_sweep():
     
     # Print simple table
     print("\nSweep Results:")
-    print(f"{'Name':<25} | {'Hidden':<6} | {'Layers':<6} | {'Window':<6} | {'Loss':<10}")
+    print(f"{'Name':<25} | {'Loss':<10} | {'Chart'}")
     print("-" * 65)
     for r in results:
         if r["status"] == "success":
-            print(f"{r['name']:<25} | {r['hidden_size']:<6} | {r['num_layers']:<6} | {r['window']:<6} | {r['best_val_loss']:.4f}")
+            print(f"{r['name']:<25} | {r['best_val_loss']:.4f} | {r.get('chart_path', 'N/A')}")
         else:
             print(f"{r['name']:<25} | FAILED")
 
