@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pkl
+
+# Virtualenvs
+.venv/
+venv/
+
+# VSCode / IDE
+.vscode/
+.idea/
+
+# Node / web UI artefacts (if any)
+node_modules/
+dist/
+.next/
+out-ui/
+
+# Lab artefacts
+# Keep raw tick files out of git, allow other data to be tracked
+# ignore only raw MDP3 tick files
+data/rawprice/
+
+# Ignore most generated output, but allow the bars and bars_indicators
+# folders to be tracked (negations below re-include them).
+out/*
+!out/bars/
+!out/bars/**
+!out/bars_indicators/
+!out/bars_indicators/**
+
+runs/
+
+# Misc
+.DS_Store
