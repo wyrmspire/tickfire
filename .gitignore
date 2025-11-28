@@ -46,3 +46,6 @@ runs/
 
 # Misc
 .DS_Store
+
+# Generated code dump (do not commit)
+tickfirecode.md
