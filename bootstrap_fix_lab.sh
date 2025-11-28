@@ -1,3 +1,12 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[tickfire-lab] Fixing run_experiment + run_single + run_sweep..."
+
+# -------------------------------------------------------------------
+# 1) Rewrite lab/engine/run_experiment.py with Path-safe JSON config
+# -------------------------------------------------------------------
+cat > lab/engine/run_experiment.py << 'EOF_RUNEXP'
 """
 Unified run executor for experiments.
 
@@ -166,3 +175,119 @@ if __name__ == "__main__":
     )
     info = run_experiment(cfg)
     print("[run_experiment.__main__] Finished:", info)
+EOF_RUNEXP
+
+# -------------------------------------------------------------------
+# 2) Rewrite scripts/run_single.py cleanly (with sys.path fix)
+# -------------------------------------------------------------------
+cat > scripts/run_single.py << 'EOF_SINGLE'
+"""
+Run a single bars+indicators experiment via the lab engine.
+
+Usage (from repo root):
+
+    python scripts/run_single.py
+"""
+
+from pathlib import Path
+from datetime import datetime
+import sys
+
+# Ensure project root (which contains the `lab` package) is on sys.path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lab.engine.run_experiment import ExperimentConfig, run_experiment
+
+
+def main() -> None:
+    sweep_id = "manual_single"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = PROJECT_ROOT / "runs" / "sweeps" / sweep_id / f"run_000_manual_single_{ts}"
+
+    cfg = ExperimentConfig(
+        name=f"manual_single_{ts}",
+        sweep_id=sweep_id,
+        experiment_kind="bars_multi_tf",
+        data_family="bars_apr07_apr25",
+        base_timeframe="15s",
+        context_timeframes=["5m", "15m"],  # just to populate the field
+        indicator_set="full_v1",
+        window=256,
+        horizon=1,
+        out_dir=run_dir,
+    )
+
+    result = run_experiment(cfg)
+    print("[run_single] Experiment completed.")
+    print(result)
+
+
+if __name__ == "__main__":
+    main()
+EOF_SINGLE
+
+# -------------------------------------------------------------------
+# 3) Rewrite scripts/run_sweep.py cleanly (with sys.path fix)
+# -------------------------------------------------------------------
+cat > scripts/run_sweep.py << 'EOF_SWEEP'
+"""
+Run a small sweep of bars+indicator experiments using the lab engine.
+
+Usage (from repo root):
+
+    python scripts/run_sweep.py
+"""
+
+from pathlib import Path
+import sys
+
+# Ensure project root (which contains the `lab` package) is on sys.path
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from lab.engine.run_experiment import ExperimentConfig, run_experiment
+
+
+def main() -> None:
+    sweep_id = "dev_sweep_stub"
+    base_dir = PROJECT_ROOT / "runs" / "sweeps" / sweep_id
+
+    configs = [
+        ExperimentConfig(
+            name=f"{sweep_id}_run_{i:03d}",
+            sweep_id=sweep_id,
+            experiment_kind="bars_multi_tf",
+            data_family=data_family,
+            base_timeframe=base_tf,
+            context_timeframes=context,
+            indicator_set=indicator,
+            window=window,
+            horizon=horizon,
+            out_dir=base_dir
+            / f"run_{i:03d}_{data_family}_{base_tf}_ind{indicator}_w{window}_h{horizon}",
+        )
+        for i, (data_family, base_tf, context, indicator, window, horizon) in enumerate(
+            [
+                ("bars_apr07_apr25", "15s", ["5m", "15m"], "full_v1", 256, 1),
+                ("bars_apr07_apr25", "15s", ["5m", "15m"], "basic", 128, 1),
+                ("bars_apr07_apr25", "1m", ["5m", "15m", "1h"], "full_v1", 256, 4),
+            ]
+        )
+    ]
+
+    for cfg in configs:
+        print(f"[run_sweep] Running: {cfg.name}")
+        result = run_experiment(cfg)
+        print("  ->", result)
+
+
+if __name__ == "__main__":
+    main()
+EOF_SWEEP
+
+echo "[tickfire-lab] Fix complete. Try:"
+echo "  python scripts/run_single.py"
+echo "  python scripts/run_sweep.py"
