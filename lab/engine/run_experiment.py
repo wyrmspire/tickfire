@@ -26,6 +26,13 @@ from lab.engine.bars_multi_tf import compile_dataset_bars_multi_tf
 from lab.models.gru import PriceGenGRU
 
 
+def repair_ohlc(o, h, l, c):
+    """Ensure high/low are consistent with open/close."""
+    hi = max(h, o, c, l)
+    lo = min(l, o, c, h)
+    return o, hi, lo, c
+
+
 @dataclass
 class ExperimentConfig:
     name: str
@@ -138,6 +145,10 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
     full_dataset.X = np.nan_to_num(full_dataset.X, nan=0.0, posinf=0.0, neginf=0.0)
     full_dataset.Y = np.nan_to_num(full_dataset.Y, nan=0.0, posinf=0.0, neginf=0.0)
 
+    # Ensure Y is 3D [N, horizon, 5]
+    if full_dataset.Y.ndim == 2:
+        full_dataset.Y = full_dataset.Y[:, None, :]
+
     N, seq_len, feat_dim = full_dataset.X.shape
     _, h, tgt_dim = full_dataset.Y.shape
 
@@ -237,7 +248,9 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
     # indices = data.get("indices") # Not currently saved in bars_multi_tf
     
     # Load model
-    ckpt = torch.load(model_path, map_location="cpu")
+    # Set weights_only=False because we are loading numpy objects (normalization stats)
+    # and potentially older numpy versions in the pickle.
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     model = PriceGenGRU(
         input_dim=int(ckpt["input_dim"]),
         hidden_dim=int(ckpt["hidden_dim"]),
@@ -371,25 +384,34 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
         # OR I can try to interpret the model output as best as possible.
         
         # Let's treat the model output as [pct_change_o, pct_change_h, pct_change_l, pct_change_c, vol_change]
-        # relative to the last close.
+        # relative to the last close (for price) and last volume (for volume).
         
         pred_vals = pred[0, 0].numpy() # [5]
         
         # Get last close from current window
         last_close = current_window_raw[-1, 3] # Index 3 is close
+        last_vol = current_window_raw[-1, 4] # Index 4 is volume
         
-        # Generate next candle (naive logic to ensure it looks like a candle)
-        # We'll add the predicted values as small perturbations
-        # This is just to make the chart look "alive" for the demo
+        # Generate next candle
+        # Targets were defined as: (Next - Curr) / Curr
+        # So Next = Curr * (1 + Pred)
+        # For volume: Next = Curr + Pred * (Curr + 1.0)
         
-        # Scale down predictions if they are huge (due to untrained model)
-        delta = pred_vals * 0.0001 
+        delta_o = pred_vals[0]
+        delta_h = pred_vals[1]
+        delta_l = pred_vals[2]
+        delta_c = pred_vals[3]
+        delta_v = pred_vals[4]
         
-        next_o = last_close * (1 + delta[0])
-        next_c = last_close * (1 + delta[3])
-        next_h = max(next_o, next_c) * (1 + abs(delta[1]))
-        next_l = min(next_o, next_c) * (1 - abs(delta[2]))
-        next_v = max(0, current_window_raw[-1, 4] + delta[4])
+        next_o = last_close * (1.0 + delta_o)
+        next_h = last_close * (1.0 + delta_h)
+        next_l = last_close * (1.0 + delta_l)
+        next_c = last_close * (1.0 + delta_c)
+        next_v = last_vol + delta_v * (last_vol + 1.0)
+        
+        # Sanity checks / Repairs
+        next_v = max(0.0, next_v)
+        next_o, next_h, next_l, next_c = repair_ohlc(next_o, next_h, next_l, next_c)
         
         next_row_vals = np.array([next_o, next_h, next_l, next_c, next_v], dtype=np.float32)
         

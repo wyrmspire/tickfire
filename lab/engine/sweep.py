@@ -38,6 +38,8 @@ def run_sweep():
             name=exp_name,
             sweep_id=sweep_id,
             out_dir=base_dir / exp_name,
+            data_family="bars_middle_2days",
+            context_timeframes=["15m"],
             hidden_size=params['hidden_size'],
             num_layers=params['num_layers'],
             window=params['window'],

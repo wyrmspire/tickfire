@@ -1,0 +1,4 @@
+Debugging generation for runs\sweeps\sweep_20251128_185654\model_3_h64_l1_w256
+Dataset: runs\sweeps\sweep_20251128_185654\model_3_h64_l1_w256\artifacts\ds_bars_15s_w256_h1.npz
+Model: runs\sweeps\sweep_20251128_185654\model_3_h64_l1_w256\model.pt
+Generation Result: {'status': 'success', 'generated_count': 960, 'csv_path': 'runs\\sweeps\\sweep_20251128_185654\\model_3_h64_l1_w256\\generated_sequence.csv'}

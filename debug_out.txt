@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "C:\tickfire\lab\engine\debug_gen.py", line 29, in debug_generation
+    result = run_generation(cfg, run_dir)
+TypeError: run_generation() missing 2 required positional arguments: 'model_path' and 'run_dir'
+Debugging generation for runs\sweeps\sweep_20251128_185654\model_3_h64_l1_w256
+Generation Failed with error:
+run_generation() missing 2 required positional arguments: 'model_path' and 'run_dir'
