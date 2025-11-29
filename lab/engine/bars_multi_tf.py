@@ -111,62 +111,59 @@ def make_sliding_windows(
     Build (X, Y) sliding windows.
 
     X: [N, window, feat_dim] from feature_cols
-    Y: [N, 5] next-step targets:
-       0: (Open_next - Close_curr) / Close_curr
-       1: (High_next - Close_curr) / Close_curr
-       2: (Low_next - Close_curr) / Close_curr
-       3: (Close_next - Close_curr) / Close_curr
-       4: (Vol_next - Vol_curr) / (Vol_curr + 1e-5)
+    Y: [N, 5] next-step targets (returns):
+
+       Let C_t = close at time t, V_t = volume at t,
+           O_{t+h}, H_{t+h}, L_{t+h}, C_{t+h}, V_{t+h} be OHLCV at horizon steps ahead.
+
+       Then:
+
+         0: (O_{t+h} - C_t) / C_t
+         1: (H_{t+h} - C_t) / C_t
+         2: (L_{t+h} - C_t) / C_t
+         3: (C_{t+h} - C_t) / C_t
+         4: (V_{t+h} - V_t) / (V_t + 1)
+
+    The model will learn to predict these returns.
     """
     values = df[feature_cols].values
-    
-    # We need OHLCV for targets. 
-    # We assume they are present in df columns "open", "high", "low", "close", "volume".
-    # If not, we fail.
+
+    # We need OHLCV for targets.
     req_cols = ["open", "high", "low", "close", "volume"]
     for c in req_cols:
         if c not in df.columns:
             raise ValueError(f"Missing required column '{c}' for target generation")
-            
+
     opens = df["open"].values.astype(float)
     highs = df["high"].values.astype(float)
     lows = df["low"].values.astype(float)
     closes = df["close"].values.astype(float)
     vols = df["volume"].values.astype(float)
 
-    # Calculate targets for the NEXT step (horizon=1 assumption for now, or roll by -horizon)
-    # If horizon > 1, this logic implies we predict the single bar at 'horizon' steps ahead, 
-    # relative to current close.
-    
     # Shifted arrays (future values)
     next_opens = np.roll(opens, -horizon)
     next_highs = np.roll(highs, -horizon)
     next_lows = np.roll(lows, -horizon)
     next_closes = np.roll(closes, -horizon)
     next_vols = np.roll(vols, -horizon)
-    
-    # Compute deltas relative to CURRENT close/vol
-    # Note: We divide by current close.
-    
+
+    # Compute returns relative to CURRENT close / volume
     tgt_open = (next_opens - closes) / closes
     tgt_high = (next_highs - closes) / closes
     tgt_low = (next_lows - closes) / closes
     tgt_close = (next_closes - closes) / closes
-    
-    # Volume change
-    tgt_vol = (next_vols - vols) / (vols + 1.0) # Add 1 to avoid div by zero/small noise
-    
-    # Stack targets [N, 5]
-    # Shape: [len(df), 5]
+    tgt_vol = (next_vols - vols) / (vols + 1.0)
+
     targets_all = np.stack([tgt_open, tgt_high, tgt_low, tgt_close, tgt_vol], axis=1)
-    
+
     X_list: List[np.ndarray] = []
     Y_list: List[np.ndarray] = []
 
     max_i = len(df) - window - horizon
     for i in range(max_i):
         X_list.append(values[i : i + window])
-        Y_list.append(targets_all[i + window]) # Target is the step AFTER the window
+        # Target is the step AFTER the window (at i + window)
+        Y_list.append(targets_all[i + window])
 
     if not X_list:
         X = np.zeros((0, window, len(feature_cols)), dtype=float)
@@ -215,71 +212,58 @@ def resolve_features(df: pd.DataFrame, indicator_set: str) -> Dict[str, Any]:
 
 
 # ------------------------------------------------------------
-# Public entry point for the experiment engine
-# ------------------------------------------------------------
-# ------------------------------------------------------------
 # MTF Merging Logic
 # ------------------------------------------------------------
+def ensure_ts_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure a 'ts' column exists (datetime64) by renaming a likely timestamp
+    column if needed.
+    """
+    if "ts" not in df.columns:
+        candidates = ["timestamp", "date", "time", "datetime"]
+        for c in candidates:
+            if c in df.columns:
+                df = df.rename(columns={c: "ts"})
+                break
+
+    if "ts" in df.columns and not pd.api.types.is_datetime64_any_dtype(df["ts"]):
+        df["ts"] = pd.to_datetime(df["ts"])
+
+    return df
+
+
 def merge_context_data(base_df: pd.DataFrame, context_df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     """
     Merge context_df onto base_df using merge_asof.
-    Assumes both have a 'ts' column or index that is datetime-like.
+    Assumes both have a 'ts' column or a convertible timestamp column.
     """
-    # Ensure 'ts' column exists and is datetime
-    if "ts" not in base_df.columns:
-        # Try to find a likely timestamp column
-        candidates = ["timestamp", "date", "time", "datetime"]
-        for c in candidates:
-            if c in base_df.columns:
-                base_df = base_df.rename(columns={c: "ts"})
-                break
-    
-    if "ts" not in context_df.columns:
-        candidates = ["timestamp", "date", "time", "datetime"]
-        for c in candidates:
-            if c in context_df.columns:
-                context_df = context_df.rename(columns={c: "ts"})
-                break
-                
+    base_df = ensure_ts_column(base_df)
+    context_df = ensure_ts_column(context_df)
+
     if "ts" not in base_df.columns:
         raise ValueError("Base dataframe missing 'ts' column for MTF merge")
     if "ts" not in context_df.columns:
         raise ValueError(f"Context dataframe ({suffix}) missing 'ts' column for MTF merge")
 
-    # Convert to datetime if needed
-    if not pd.api.types.is_datetime64_any_dtype(base_df["ts"]):
-        base_df["ts"] = pd.to_datetime(base_df["ts"])
-    if not pd.api.types.is_datetime64_any_dtype(context_df["ts"]):
-        context_df["ts"] = pd.to_datetime(context_df["ts"])
-
     # Sort for asof merge
     base_df = base_df.sort_values("ts")
     context_df = context_df.sort_values("ts")
 
-    # Rename context columns to avoid collision
-    # We keep 'ts' for merging, but we might drop it after or keep it?
-    # merge_asof will keep the 'on' column from left (base).
-    
-    # Identify columns to merge (exclude ts)
+    # Rename context columns (except ts) to avoid collisions
     ctx_cols = [c for c in context_df.columns if c != "ts"]
     rename_map = {c: f"{c}_{suffix}" for c in ctx_cols}
     context_df_renamed = context_df.rename(columns=rename_map)
-    
-    # Merge
-    # direction='backward' means for a given base_ts, we take the context row 
-    # where context_ts <= base_ts (the latest known context bar).
+
     merged = pd.merge_asof(
         base_df,
         context_df_renamed,
         on="ts",
-        direction="backward"
+        direction="backward",
     )
-    
-    # Forward fill any missing values if context data starts later?
-    # merge_asof handles the matching, but if base starts before context, we get NaNs.
-    # We can ffill or fillna(0).
+
+    # Fill NaNs (e.g., base starts before context)
     merged = merged.fillna(0)
-    
+
     return merged
 
 
@@ -311,43 +295,39 @@ def compile_dataset_bars_multi_tf(cfg, run_dir: Path) -> Dict[str, Any]:
     if "close" not in df.columns:
         raise ValueError(f"'close' column is required but missing; df.columns={list(df.columns)}")
 
+    # Ensure we have a usable timestamp axis if possible
+    df = ensure_ts_column(df)
+    has_ts = "ts" in df.columns
+    ts_array = None
+    seed_ts = None
+    if has_ts:
+        ts_series = pd.to_datetime(df["ts"])
+        ts_array = ts_series.values.astype("datetime64[ns]")
+        if len(ts_array) > 0:
+            seed_ts = ts_array[-1]
+
     # --------------------------------------------------------
     # MTF Context Merging
     # --------------------------------------------------------
     context_tfs = cfg.context_timeframes or []
     for ctx_tf in context_tfs:
         print(f"Loading context data for {ctx_tf}...")
-        # Load context data for same dates
         ctx_df = join_dates_to_df(out_dir, dates, ctx_tf)
-        
-        # Merge
         df = merge_context_data(df, ctx_df, suffix=ctx_tf)
         print(f"Merged {ctx_tf} context. New shape: {df.shape}")
 
     # resolve features against actual columns
-    # We need to include the new context columns in the feature set
-    # For now, we'll just grab ALL columns that are numeric?
-    # Or we extend the palette?
-    
-    # If we use "basic" palette, it only looks for OHLCV.
-    # We want to include the context OHLCV too.
-    
-    # Let's dynamically add context columns to the desired feature list
     feat_info = resolve_features(df, cfg.indicator_set)
     feature_cols = feat_info["features"]
-    
-    # Add context columns
+
+    # Add context columns (e.g., open_15m, high_15m, ...)
     for ctx_tf in context_tfs:
-        # We assume context has at least OHLCV
-        # The columns would be open_15m, high_15m, etc.
-        # Let's find them in df
         suffix = f"_{ctx_tf}"
         ctx_cols = [c for c in df.columns if c.endswith(suffix)]
         feature_cols.extend(ctx_cols)
-        
-    # Remove duplicates just in case
+
+    # Remove duplicates
     feature_cols = list(dict.fromkeys(feature_cols))
-    
     missing_cols = feat_info["missing"]
 
     # build sliding windows
@@ -363,7 +343,18 @@ def compile_dataset_bars_multi_tf(cfg, run_dir: Path) -> Dict[str, Any]:
     art_dir.mkdir(parents=True, exist_ok=True)
 
     out_path = art_dir / f"ds_bars_{tf}_w{cfg.window}_h{cfg.horizon}.npz"
-    np.savez_compressed(out_path, X=X, Y=Y, feature_cols=feature_cols)
+
+    save_dict: Dict[str, Any] = {
+        "X": X,
+        "Y": Y,
+        "feature_cols": np.array(feature_cols),
+    }
+    if ts_array is not None:
+        save_dict["ts"] = ts_array
+    if seed_ts is not None:
+        save_dict["seed_ts"] = np.array(seed_ts)
+
+    np.savez_compressed(out_path, **save_dict)
 
     return {
         "dataset_path": str(out_path),

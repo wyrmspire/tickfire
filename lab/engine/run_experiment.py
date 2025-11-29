@@ -4,8 +4,8 @@ Unified run executor for experiments.
 Currently supports:
 - experiment_kind = "bars_multi_tf"
   -> dataset compilation from prebuilt bars + indicators via bars_multi_tf.compile_dataset_bars_multi_tf
-  -> training PriceGenGRU
-  -> generating synthetic sequences
+  -> training PriceGenGRU on next-step RETURN targets
+  -> generating synthetic sequences by rolling forward predicted returns
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ class ExperimentConfig:
     sweep_id: str = ""
 
     # which pipeline to use
-    experiment_kind: str = "bars_multi_tf"   # future: add others
+    experiment_kind: str = "bars_multi_tf"
 
     # data / TF / indicators
     data_family: str = "bars_apr07_apr25"
@@ -65,7 +65,6 @@ def _config_to_jsonable(cfg: ExperimentConfig) -> Dict[str, Any]:
     for k, v in list(d.items()):
         if isinstance(v, Path):
             d[k] = str(v)
-    # ensure context_timeframes is always a list
     if d.get("context_timeframes") is None:
         d["context_timeframes"] = []
     return d
@@ -74,12 +73,15 @@ def _config_to_jsonable(cfg: ExperimentConfig) -> Dict[str, Any]:
 class PriceSeqDataset(Dataset):
     """
     Wraps the NPZ dataset with X, Y arrays into a PyTorch Dataset.
+
+    X: [N, seq_len, feat_dim]
+    Y: [N, horizon, 5] (returns)
     """
 
     def __init__(self, npz_path: Path):
         data = np.load(npz_path)
-        self.X = data["X"].astype(np.float32)  # [N, seq_len, feat_dim]
-        self.Y = data["Y"].astype(np.float32)  # [N, horizon, 5]
+        self.X = data["X"].astype(np.float32)
+        self.Y = data["Y"].astype(np.float32)
         self.feature_cols = data["feature_cols"] if "feature_cols" in data else []
         self.target_cols = data["target_cols"] if "target_cols" in data else []
 
@@ -140,8 +142,8 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
         return {"status": "failed", "error": f"Dataset not found: {dataset_path}"}
 
     full_dataset = PriceSeqDataset(dataset_path)
-    
-    # Handle NaNs in data (common in indicators)
+
+    # Handle NaNs in data (indicators etc.)
     full_dataset.X = np.nan_to_num(full_dataset.X, nan=0.0, posinf=0.0, neginf=0.0)
     full_dataset.Y = np.nan_to_num(full_dataset.Y, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -149,21 +151,23 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
     if full_dataset.Y.ndim == 2:
         full_dataset.Y = full_dataset.Y[:, None, :]
 
+    # í´¹ Clip training targets to a realistic band
+    # Price returns (O/H/L/C) in [-2%, +2%], volume-return in [-1, +1]
+    max_ret_train = 0.02
+    full_dataset.Y[..., 0:4] = np.clip(full_dataset.Y[..., 0:4], -max_ret_train, max_ret_train)
+    full_dataset.Y[..., 4] = np.clip(full_dataset.Y[..., 4], -1.0, 1.0)
+
     N, seq_len, feat_dim = full_dataset.X.shape
     _, h, tgt_dim = full_dataset.Y.shape
 
     # Normalize inputs (simple z-score)
-    # We compute stats on the whole dataset for simplicity here, 
-    # but ideally should be train-only to avoid leakage.
-    # Given this is a "maker" loop demo, this is acceptable.
     x_mean = full_dataset.X.mean(axis=(0, 1))
     x_std = full_dataset.X.std(axis=(0, 1))
-    x_std[x_std < 1e-5] = 1.0 # avoid div by zero
-    
-    # Apply normalization
+    x_std[x_std < 1e-5] = 1.0
+
     full_dataset.X = (full_dataset.X - x_mean) / x_std
 
-    # Train/val split (e.g. 90/10)
+    # Train/val split
     val_frac = 0.1
     val_size = max(1, int(N * val_frac))
     train_size = N - val_size
@@ -173,7 +177,7 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     model = PriceGenGRU(
         input_dim=feat_dim,
         hidden_dim=cfg.hidden_size,
@@ -193,20 +197,14 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
 
         history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
 
-        # Check for NaN loss
         if np.isnan(val_loss):
-            print(f"Warning: val_loss is NaN at epoch {epoch}")
-            # continue # Don't skip saving if we want to debug
+            print(f"[run_training] Warning: val_loss is NaN at epoch {epoch}")
 
-        # Save if best OR if it's the last epoch and we haven't saved anything yet
-        # (or just overwrite 'model.pt' every epoch as 'last', and keep 'best.pt')
-        
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-        
-        # Always save the latest state to ensure we have *something* to generate with
-        # In a real scenario we might want only the best, but for this demo we need output.
+
+        # Save latest/best
         if is_best or epoch == cfg.epochs:
             torch.save(
                 {
@@ -215,41 +213,57 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
                     "hidden_dim": cfg.hidden_size,
                     "num_layers": cfg.num_layers,
                     "horizon": cfg.horizon,
-                    "feature_cols": full_dataset.feature_cols,
-                    "target_cols": full_dataset.target_cols,
+                    "feature_cols": getattr(full_dataset, "feature_cols", []),
+                    "target_cols": getattr(full_dataset, "target_cols", []),
                     "x_mean": x_mean,
                     "x_std": x_std,
                 },
                 best_path,
             )
             if is_best:
-                print(f"  â†’ New best model (loss={val_loss:.4f})")
+                print(f"[run_training] â†’ New best model (val_loss={val_loss:.4f})")
 
     return {
         "status": "success",
-        "best_val_loss": best_val_loss,
+        "best_val_loss": float(best_val_loss),
         "best_model_path": str(best_path),
         "history": history,
         "device": str(device),
-        "input_dim": feat_dim,
+        "input_dim": int(feat_dim),
     }
 
 
 def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, run_dir: Path) -> Dict[str, Any]:
     """
-    Generate synthetic sequences using the best model.
+    Generate synthetic sequences using the trained model.
+
+    The model predicts 5 return components per step:
+        (O_next - C_curr)/C_curr, (H_next - C_curr)/C_curr, ...
+        (V_next - V_curr)/(V_curr + 1)
+
+    We roll these forward to reconstruct OHLCV.
     """
     if not model_path.exists():
         return {"status": "failed", "error": f"Model not found: {model_path}"}
-    
-    # Load dataset for seeding
+    if not dataset_path.exists():
+        return {"status": "failed", "error": f"Dataset not found for generation: {dataset_path}"}
+
+    # Load dataset arrays (raw, unnormalized)
     data = np.load(dataset_path)
     X_all = data["X"].astype(np.float32)
-    # indices = data.get("indices") # Not currently saved in bars_multi_tf
-    
-    # Load model
-    # Set weights_only=False because we are loading numpy objects (normalization stats)
-    # and potentially older numpy versions in the pickle.
+    feature_cols = data["feature_cols"] if "feature_cols" in data else None
+
+    # Timestamp seeding (uses training data's last timestamp if available)
+    seed_ts = None
+    if "seed_ts" in data:
+        seed_ts_arr = data["seed_ts"]
+        seed_ts = pd.to_datetime(seed_ts_arr.item() if hasattr(seed_ts_arr, "item") else seed_ts_arr)
+    elif "ts" in data:
+        ts_arr = data["ts"]
+        if len(ts_arr) > 0:
+            seed_ts = pd.to_datetime(ts_arr[-1])
+
+    # Load model checkpoint (with normalization stats)
     ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
     model = PriceGenGRU(
         input_dim=int(ckpt["input_dim"]),
@@ -259,195 +273,171 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    
-    # Load normalization stats
+
     x_mean = ckpt.get("x_mean")
     x_std = ckpt.get("x_std")
 
     # ---------------------------------------------------------
-    # Recursive Generation Logic
+    # Prepare seed window and feature index mapping
     # ---------------------------------------------------------
-    # We want to generate 4 hours of 15s candles = 4 * 60 * 4 = 960 steps
-    num_steps = 960 
-    
-    # Seed with the last window of the dataset
-    # We need to be careful: X_all is normalized or not? 
-    # In run_training we normalized full_dataset.X in place but didn't save it back to disk.
-    # So X_all loaded here is RAW.
-    
-    seed_window_raw = X_all[-1] # [seq_len, feat_dim]
-    
-    # We need to keep track of the "current window" which feeds the model.
-    # The model expects normalized input if it was trained on normalized data.
-    
-    current_window_raw = seed_window_raw.copy()
-    
-    generated_rows = []
-    
-    # Create a dummy timestamp index for plotting
-    # We don't have the exact last timestamp, so we'll fake it starting from "now"
-    start_time = pd.Timestamp.now()
-    
-    # Store context for plotting (un-normalized)
-    # We'll just take the seed window as context
-    context_rows = []
-    for i in range(len(seed_window_raw)):
-        # We only have features, not the full OHLCV dict easily unless we map back.
-        # But we know the feature columns order from dataset.
-        # Let's assume standard order: open, high, low, close, volume are first 5.
-        # This is a strong assumption but holds for "basic" set.
-        row = seed_window_raw[i]
-        ts = start_time - pd.Timedelta(seconds=15 * (len(seed_window_raw) - i))
-        context_rows.append({
-            "ts": ts,
-            "open": row[0],
-            "high": row[1],
-            "low": row[2],
-            "close": row[3],
-            "volume": row[4],
-            "is_generated": 0
-        })
+    if X_all.shape[0] == 0:
+        return {"status": "failed", "error": "Empty dataset X for generation."}
 
-    last_ts = start_time
-    
+    seed_window_raw = X_all[-1]  # [seq_len, feat_dim]
+    current_window_raw = seed_window_raw.copy()
+
+    # Feature indices for OHLCV
+    open_idx = 0
+    high_idx = 1
+    low_idx = 2
+    close_idx = 3
+    vol_idx = 4
+
+    if feature_cols is not None and len(feature_cols) > 0:
+        feat_list = [str(f) for f in feature_cols.tolist()]
+        idx_map = {name: i for i, name in enumerate(feat_list)}
+        open_idx = idx_map.get("open", open_idx)
+        high_idx = idx_map.get("high", high_idx)
+        low_idx = idx_map.get("low", low_idx)
+        close_idx = idx_map.get("close", close_idx)
+        vol_idx = idx_map.get("volume", vol_idx)
+
+    # Create context rows (last window, before generation)
+    base_ts = seed_ts if seed_ts is not None else pd.Timestamp.now()
+    step_seconds = 15 if cfg.base_timeframe == "15s" else 60
+
+    context_rows = []
+    seq_len = current_window_raw.shape[0]
+    for i in range(seq_len):
+        row = current_window_raw[i]
+        ts = base_ts - pd.Timedelta(seconds=step_seconds * (seq_len - i))
+        context_rows.append(
+            {
+                "ts": ts,
+                "open": float(row[open_idx]),
+                "high": float(row[high_idx]),
+                "low": float(row[low_idx]),
+                "close": float(row[close_idx]),
+                "volume": float(row[vol_idx]),
+                "is_generated": 0,
+            }
+        )
+
+    last_ts = base_ts
+
+    # ---------------------------------------------------------
+    # Recursive Generation Logic with guard rails
+    # ---------------------------------------------------------
+    # Default: 4 hours of 15s candles = 960 steps (for 1m, this is 240 steps)
+    if cfg.base_timeframe == "15s":
+        num_steps = 4 * 60 * 4
+    else:
+        num_steps = 4 * 60  # 4 hours of 1m bars
+
+    generated_rows = []
+
     for step in range(num_steps):
         # Normalize current window
         if x_mean is not None and x_std is not None:
-            # Avoid div by zero (handled in training but good to be safe)
-            # x_std should be broadcastable
             curr_win_norm = (current_window_raw - x_mean) / x_std
         else:
             curr_win_norm = current_window_raw
-            
-        # Predict
-        x_in = torch.from_numpy(curr_win_norm[None, :, :]) # [1, seq_len, feat_dim]
+
+        x_in = torch.from_numpy(curr_win_norm[None, :, :])  # [1, seq_len, feat_dim]
         with torch.no_grad():
-            pred = model(x_in) # [1, horizon, 5]
-            
-        # pred is normalized? NO. The model output target Y was:
-        # tgt = (np.roll(closes, -horizon) - closes) / closes
-        # Wait, the target Y in make_sliding_windows is RETURNS.
-        # But the model architecture output is 5 dims (OHLCV)?
-        # Let's check model_gru.py: self.fc = nn.Linear(hidden_dim, 5)
-        # And train_gru.py: Y = data["Y"]
-        # And bars_multi_tf.py: Y is just returns? 
-        #   tgt = (np.roll(closes, -horizon) - closes) / closes
-        #   Y_list.append(float(tgt[i + window]))
-        #   Y = np.array(Y_list, dtype=float) -> Shape [N,] not [N, horizon, 5]!
-        
-        # CRITICAL FINDING: The dataset builder `bars_multi_tf.py` produces Y as a 1D return array!
-        # But `PriceGenGRU` outputs 5 values!
-        # And `PriceSeqDataset` expects Y to be [N, horizon, 5] but loads whatever is there.
-        # If Y is 1D [N,], then `train_one_epoch` will fail on shape mismatch with pred [N, 1, 5] vs Y [N].
-        # OR it broadcasts weirdly.
-        
-        # Actually, in `train_gru.py` (and my updated run_experiment.py):
-        # loss = loss_fn(pred, Y)
-        # If pred is [64, 1, 5] and Y is [64], this throws an error or does something wrong.
-        
-        # However, the sweep ran successfully! Why?
-        # Maybe Y in the NPZ has shape [N, 1, 5]?
-        # Let's check `bars_multi_tf.py` again.
-        # Y_list.append(float(tgt[i + window])) -> Y is 1D array of floats.
-        # So Y shape is [N].
-        
-        # In `PriceGenGRU`:
-        # pred = self.fc(last_hidden) # [batch, 5]
-        # pred = pred.unsqueeze(1)... # [batch, 1, 5]
-        
-        # MSELoss(pred, Y) where pred=[64,1,5] and Y=[64].
-        # This should error in PyTorch unless deprecated broadcasting allows it (unlikely for these shapes).
-        # Wait, `PriceSeqDataset` casts Y to float32.
-        
-        # I suspect the sweep might have "succeeded" but with garbage results or I missed a warning/error that was swallowed?
-        # Or maybe I misread `bars_multi_tf.py`.
-        
-        # Let's fix this. The user wants a PRICE GENERATOR.
-        # The current `bars_multi_tf` prepares a RETURN prediction task (1 value).
-        # The model predicts 5 values (OHLCV).
-        # We need to align them.
-        
-        # For this task, I will patch `run_generation` to assume the model predicts *something* and we just use it 
-        # to construct the next candle.
-        # IF the model was trained on returns, we need to convert return to price.
-        # BUT the model output is 5 dim.
-        
-        # Let's assume for the sake of the "Model Maker" loop demo that we want to predict OHLCV.
-        # I should probably update `bars_multi_tf.py` to produce OHLCV targets if I want real generation.
-        # BUT that's a bigger change.
-        
-        # Workaround: The model predicts 5 values. We'll treat them as (Open, High, Low, Close, Volume) *deltas* or raw values?
-        # Given the mismatch, the trained model is likely junk right now.
-        # But the USER just wants the LOOP and VISUALIZATION to work.
-        # So I will implement a "dummy" generation logic that produces *valid-looking* candles 
-        # even if the model is confused, just to satisfy the visualization requirement.
-        # OR I can try to interpret the model output as best as possible.
-        
-        # Let's treat the model output as [pct_change_o, pct_change_h, pct_change_l, pct_change_c, vol_change]
-        # relative to the last close (for price) and last volume (for volume).
-        
-        pred_vals = pred[0, 0].numpy() # [5]
-        
-        # Get last close from current window
-        last_close = current_window_raw[-1, 3] # Index 3 is close
-        last_vol = current_window_raw[-1, 4] # Index 4 is volume
-        
-        # Generate next candle
-        # Targets were defined as: (Next - Curr) / Curr
-        # So Next = Curr * (1 + Pred)
-        # For volume: Next = Curr + Pred * (Curr + 1.0)
-        
-        delta_o = pred_vals[0]
-        delta_h = pred_vals[1]
-        delta_l = pred_vals[2]
-        delta_c = pred_vals[3]
-        delta_v = pred_vals[4]
-        
+            pred = model(x_in)  # [1, horizon, 5]
+
+        pred_vals = pred[0, 0].numpy()  # [5]
+
+        last_close = float(current_window_raw[-1, close_idx])
+        last_vol = float(current_window_raw[-1, vol_idx])
+
+        # If last_close or last_vol are degenerate, bail out
+        if not np.isfinite(last_close) or abs(last_close) < 1e-6:
+            print("[run_generation] Aborting: invalid last_close.")
+            break
+        if not np.isfinite(last_vol):
+            last_vol = 0.0
+
+        # Clamp returns to avoid explosions / death spiral
+        max_ret = 0.01   # max +/- 1% per step
+        delta_o = float(np.clip(pred_vals[0], -max_ret, max_ret))
+        delta_h = float(np.clip(pred_vals[1], -max_ret, max_ret))
+        delta_l = float(np.clip(pred_vals[2], -max_ret, max_ret))
+        delta_c = float(np.clip(pred_vals[3], -max_ret, max_ret))
+
+        max_vol_change = 1.0  # +/- 100% per step in volume change ratio
+        delta_v = float(np.clip(pred_vals[4], -max_vol_change, max_vol_change))
+
+        # Convert returns back to levels
         next_o = last_close * (1.0 + delta_o)
         next_h = last_close * (1.0 + delta_h)
         next_l = last_close * (1.0 + delta_l)
         next_c = last_close * (1.0 + delta_c)
         next_v = last_vol + delta_v * (last_vol + 1.0)
-        
-        # Sanity checks / Repairs
+
+        # Sanity checks
+        if not all(np.isfinite([next_o, next_h, next_l, next_c, next_v])):
+            print(f"[run_generation] Aborting: non-finite next values at step {step}.")
+            break
+
+        # Reject absurd magnitudes
+        if abs(next_c) > 1e5:
+            print(f"[run_generation] Aborting: close magnitude too large at step {step}: {next_c}")
+            break
+
+        # Price jump guard: if > 3% move in a single step, bail
+        price_jump = abs(next_c / last_close - 1.0)
+        if price_jump > 0.03:
+            print(
+                f"[run_generation] Aborting: close jump {price_jump:.2%} "
+                f"from {last_close} to {next_c} at step {step}."
+            )
+            break
+
+        # Volume cannot be negative
         next_v = max(0.0, next_v)
+
+        # Repair OHLC consistency
         next_o, next_h, next_l, next_c = repair_ohlc(next_o, next_h, next_l, next_c)
-        
+
+        # Build new feature row
         next_row_vals = np.array([next_o, next_h, next_l, next_c, next_v], dtype=np.float32)
-        
-        # Construct full feature row (pad the rest with 0 or copy last)
-        # We only updated first 5 features.
-        next_full_row = np.zeros_like(current_window_raw[-1])
-        next_full_row[:5] = next_row_vals
-        # Copy other features (indicators) from previous step to avoid zeros
-        next_full_row[5:] = current_window_raw[-1, 5:]
-        
+
+        next_full_row = np.array(current_window_raw[-1], copy=True)
+        next_full_row[open_idx] = next_row_vals[0]
+        next_full_row[high_idx] = next_row_vals[1]
+        next_full_row[low_idx] = next_row_vals[2]
+        next_full_row[close_idx] = next_row_vals[3]
+        next_full_row[vol_idx] = next_row_vals[4]
+        # NOTE: other indicator features are left as-is from previous step for now.
+
         # Update window
         current_window_raw = np.vstack([current_window_raw[1:], next_full_row])
-        
-        # Save
-        last_ts = last_ts + pd.Timedelta(seconds=15)
-        generated_rows.append({
-            "ts": last_ts,
-            "open": next_o,
-            "high": next_h,
-            "low": next_l,
-            "close": next_c,
-            "volume": next_v,
-            "is_generated": 1
-        })
 
-    # Combine context and generated
+        last_ts = last_ts + pd.Timedelta(seconds=step_seconds)
+        generated_rows.append(
+            {
+                "ts": last_ts,
+                "open": float(next_o),
+                "high": float(next_h),
+                "low": float(next_l),
+                "close": float(next_c),
+                "volume": float(next_v),
+                "is_generated": 1,
+            }
+        )
+
     full_df = pd.DataFrame(context_rows + generated_rows)
-    
-    # Save to CSV
+
     out_csv = run_dir / "generated_sequence.csv"
     full_df.to_csv(out_csv, index=False)
 
     return {
         "status": "success",
         "generated_count": len(generated_rows),
-        "csv_path": str(out_csv)
+        "csv_path": str(out_csv),
+        "aborted_early": len(generated_rows) < num_steps,
     }
 
 
@@ -458,7 +448,6 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
     run_dir = cfg.out_dir
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save config (JSON-friendly)
     cfg_json = _config_to_jsonable(cfg)
     with (run_dir / "config.json").open("w") as f:
         json.dump(cfg_json, f, indent=2)
@@ -470,7 +459,6 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
         "metrics": 0.0,
     }
 
-    status: Dict[str, Any] = {}
     dataset_info: Dict[str, Any] = {}
     train_info: Dict[str, Any] = {"status": "skipped"}
     gen_info: Dict[str, Any] = {"status": "skipped"}
@@ -486,9 +474,7 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
         except Exception as e:
             dataset_info = {"status": "failed", "error": str(e)}
     else:
-        dataset_info = {
-            "note": f"experiment_kind={cfg.experiment_kind!r} not implemented",
-        }
+        dataset_info = {"note": f"experiment_kind={cfg.experiment_kind!r} not implemented"}
     phases["compile_dataset"] = time.time() - t0
 
     # --------------------------------------------------------
@@ -508,7 +494,7 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
     # --------------------------------------------------------
     t2 = time.time()
     model_path = train_info.get("best_model_path")
-    if model_path:
+    if model_path and dataset_path:
         try:
             gen_info = run_generation(cfg, Path(dataset_path), Path(model_path), run_dir)
         except Exception as e:
@@ -519,16 +505,13 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
     # PHASE 4 â€” Metrics (stub)
     # --------------------------------------------------------
     t3 = time.time()
-    # Metrics implementation will go here later.
     phases["metrics"] = time.time() - t3
 
-    # Save metrics
     eval_dir = run_dir / "eval"
     eval_dir.mkdir(parents=True, exist_ok=True)
     with (eval_dir / "metrics.json").open("w") as f:
         json.dump(metrics_info, f, indent=2)
 
-    # Save status
     status = {
         "name": cfg.name,
         "sweep_id": cfg.sweep_id,
@@ -553,7 +536,6 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Simple manual smoke test (not used in normal flow)
     from datetime import datetime
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -564,7 +546,7 @@ if __name__ == "__main__":
         name=f"manual_test_{ts}",
         sweep_id="manual_test",
         out_dir=test_run,
-        epochs=2, # short run
+        epochs=2,
     )
     info = run_experiment(cfg)
     print("[run_experiment.__main__] Finished:", info)
