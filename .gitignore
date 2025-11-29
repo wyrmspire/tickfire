@@ -7,7 +7,15 @@ __pycache__/
 
 # Virtualenvs
 .venv/
+.venv312/
 venv/
+
+# AI inspection files
+*.ai.txt
+*.inspect.txt
+*_dump.txt
+
+
 
 # VSCode / IDE
 .vscode/
