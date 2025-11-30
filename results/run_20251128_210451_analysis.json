@@ -1,0 +1,15 @@
+{
+  "status": "ok",
+  "num_context_rows": 256,
+  "num_generated_rows": 697,
+  "start_ts": "2025-04-17 21:00:00",
+  "end_ts": "2025-04-17 23:54:00",
+  "start_close": 5332.760714996606,
+  "end_close": 99030.39739995914,
+  "total_drift_pct": 1757.0193318719375,
+  "mean_ret_per_bar": 0.0042470280860087035,
+  "std_ret_per_bar": 0.009007301258907523,
+  "max_abs_ret_per_bar": 0.010000059529532868,
+  "flag_explosive": false,
+  "flag_huge_drift": true
+}

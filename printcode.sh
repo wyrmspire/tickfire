@@ -13,7 +13,8 @@ echo >> "$OUT_FILE"
 echo "Scanning repository for code files..." >&2
 
 # Directories to exclude (paths relative to repo root)
-EXCLUDE_DIRS=("./data" "./out" "./runs" "./.git" "./node_modules" "./.venv" "./venv")
+# Add the project's virtualenv `.venv312` so the code-dump doesn't traverse it
+EXCLUDE_DIRS=("./data" "./out" "./runs" "./.git" "./node_modules" "./.venv" "./.venv312" "./venv")
 
 # Build find prune args
 PRUNE_ARGS=()

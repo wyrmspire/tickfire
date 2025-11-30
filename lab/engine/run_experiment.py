@@ -1,11 +1,11 @@
 """
 Unified run executor for experiments.
 
-Currently supports:
-- experiment_kind = "bars_multi_tf"
-  -> dataset compilation from prebuilt bars + indicators via bars_multi_tf.compile_dataset_bars_multi_tf
-  -> training PriceGenGRU on next-step RETURN targets
-  -> generating synthetic sequences by rolling forward predicted returns
+experiment_kind = "bars_multi_tf":
+- compile multi-timeframe dataset via bars_multi_tf.compile_dataset_bars_multi_tf
+- train PriceGenGRU on next-step additive OHLCV+V *tick* deltas
+- generate synthetic sequences by adding predicted tick deltas to last close/volume,
+  then snapping back to 0.25-tick prices and integer volume.
 """
 
 from __future__ import annotations
@@ -23,14 +23,30 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 
 from lab.engine.bars_multi_tf import compile_dataset_bars_multi_tf
+from lab.engine.plot_results import plot_model_result
 from lab.models.gru import PriceGenGRU
 
 
-def repair_ohlc(o, h, l, c):
+# MES-style tick size
+TICK_SIZE = 0.25
+
+
+def repair_ohlc(o: float, h: float, l: float, c: float):
     """Ensure high/low are consistent with open/close."""
     hi = max(h, o, c, l)
     lo = min(l, o, c, h)
     return o, hi, lo, c
+
+
+def round_to_tick(x: float, tick: float = TICK_SIZE) -> float:
+    """Snap a price to the nearest tick."""
+    return float(np.round(x / tick) * tick)
+
+
+def round_volume(v: float) -> int:
+    """Non-negative integer volume."""
+    v = max(0.0, v)
+    return int(np.round(v))
 
 
 @dataclass
@@ -75,7 +91,19 @@ class PriceSeqDataset(Dataset):
     Wraps the NPZ dataset with X, Y arrays into a PyTorch Dataset.
 
     X: [N, seq_len, feat_dim]
-    Y: [N, horizon, 5] (returns)
+    Y: [N, horizon, 5] additive deltas in *price space*:
+
+       0: O_next - C_curr
+       1: H_next - C_curr
+       2: L_next - C_curr
+       3: C_next - C_curr
+       4: V_next - V_curr
+
+    For training, we convert price deltas -> tick deltas by dividing by TICK_SIZE.
+    The model predicts *normalized tick deltas*; at generation time we:
+    - denormalize to tick deltas
+    - convert to price deltas via tick_size
+    - snap to the nearest tick + integer volume
     """
 
     def __init__(self, npz_path: Path):
@@ -137,6 +165,8 @@ def eval_one_epoch(model, loader, device):
 def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Dict[str, Any]:
     """
     Train the model using the compiled dataset.
+
+    Important: we convert price deltas -> tick deltas for Y before normalization.
     """
     if not dataset_path.exists():
         return {"status": "failed", "error": f"Dataset not found: {dataset_path}"}
@@ -151,20 +181,32 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
     if full_dataset.Y.ndim == 2:
         full_dataset.Y = full_dataset.Y[:, None, :]
 
-    # ��� Clip training targets to a realistic band
-    # Price returns (O/H/L/C) in [-2%, +2%], volume-return in [-1, +1]
-    max_ret_train = 0.02
-    full_dataset.Y[..., 0:4] = np.clip(full_dataset.Y[..., 0:4], -max_ret_train, max_ret_train)
-    full_dataset.Y[..., 4] = np.clip(full_dataset.Y[..., 4], -1.0, 1.0)
+    N = full_dataset.X.shape[0]
 
-    N, seq_len, feat_dim = full_dataset.X.shape
-    _, h, tgt_dim = full_dataset.Y.shape
+    # Interpret Y as price-space additive deltas
+    price_deltas = full_dataset.Y[..., 0:4]  # O/H/L/C deltas in price units
+    vol_deltas = full_dataset.Y[..., 4]      # V deltas in volume units
+
+    # Convert price deltas to tick deltas
+    tick_deltas = price_deltas / TICK_SIZE
+
+    # Compute scales in tick + volume space
+    tick_scale = np.percentile(np.abs(tick_deltas), 95)
+    if not np.isfinite(tick_scale) or tick_scale < 0.5:
+        tick_scale = 1.0
+
+    vol_scale = np.percentile(np.abs(vol_deltas), 95)
+    if not np.isfinite(vol_scale) or vol_scale < 1e-6:
+        vol_scale = 1.0
+
+    # Normalize and clamp to a reasonable range (e.g. [-3, 3])
+    full_dataset.Y[..., 0:4] = np.clip(tick_deltas / tick_scale, -3.0, 3.0)
+    full_dataset.Y[..., 4] = np.clip(vol_deltas / vol_scale, -3.0, 3.0)
 
     # Normalize inputs (simple z-score)
     x_mean = full_dataset.X.mean(axis=(0, 1))
     x_std = full_dataset.X.std(axis=(0, 1))
     x_std[x_std < 1e-5] = 1.0
-
     full_dataset.X = (full_dataset.X - x_mean) / x_std
 
     # Train/val split
@@ -177,9 +219,10 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[run_training] Using device: {device}")
 
     model = PriceGenGRU(
-        input_dim=feat_dim,
+        input_dim=full_dataset.X.shape[2],
         hidden_dim=cfg.hidden_size,
         num_layers=cfg.num_layers,
         horizon=cfg.horizon,
@@ -203,13 +246,12 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
+            print(f"[run_training] → New best model (val_loss={val_loss:.4f})")
 
-        # Save latest/best
-        if is_best or epoch == cfg.epochs:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "input_dim": feat_dim,
+                    "input_dim": int(full_dataset.X.shape[2]),
                     "hidden_dim": cfg.hidden_size,
                     "num_layers": cfg.num_layers,
                     "horizon": cfg.horizon,
@@ -217,11 +259,12 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
                     "target_cols": getattr(full_dataset, "target_cols", []),
                     "x_mean": x_mean,
                     "x_std": x_std,
+                    "tick_scale": float(tick_scale),
+                    "tick_size": float(TICK_SIZE),
+                    "vol_scale": float(vol_scale),
                 },
                 best_path,
             )
-            if is_best:
-                print(f"[run_training] → New best model (val_loss={val_loss:.4f})")
 
     return {
         "status": "success",
@@ -229,7 +272,10 @@ def run_training(cfg: ExperimentConfig, dataset_path: Path, run_dir: Path) -> Di
         "best_model_path": str(best_path),
         "history": history,
         "device": str(device),
-        "input_dim": int(feat_dim),
+        "input_dim": int(full_dataset.X.shape[2]),
+        "tick_scale": float(tick_scale),
+        "tick_size": float(TICK_SIZE),
+        "vol_scale": float(vol_scale),
     }
 
 
@@ -237,11 +283,20 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
     """
     Generate synthetic sequences using the trained model.
 
-    The model predicts 5 return components per step:
-        (O_next - C_curr)/C_curr, (H_next - C_curr)/C_curr, ...
-        (V_next - V_curr)/(V_curr + 1)
+    The model predicts 5 normalized components per step:
 
-    We roll these forward to reconstruct OHLCV.
+        normalized_targets ≈ [
+            tick_delta_O / tick_scale,
+            tick_delta_H / tick_scale,
+            tick_delta_L / tick_scale,
+            tick_delta_C / tick_scale,
+            volume_delta   / vol_scale,
+        ]
+
+    where tick_delta_* are in *ticks* (price_delta / tick_size).
+
+    We denormalize to tick deltas, convert back to price deltas with tick_size,
+    add to last close/volume, then snap prices to the tick grid and volume to ints.
     """
     if not model_path.exists():
         return {"status": "failed", "error": f"Model not found: {model_path}"}
@@ -253,38 +308,13 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
     X_all = data["X"].astype(np.float32)
     feature_cols = data["feature_cols"] if "feature_cols" in data else None
 
-    # Timestamp seeding (uses training data's last timestamp if available)
-    seed_ts = None
-    if "seed_ts" in data:
-        seed_ts_arr = data["seed_ts"]
-        seed_ts = pd.to_datetime(seed_ts_arr.item() if hasattr(seed_ts_arr, "item") else seed_ts_arr)
-    elif "ts" in data:
-        ts_arr = data["ts"]
-        if len(ts_arr) > 0:
-            seed_ts = pd.to_datetime(ts_arr[-1])
-
-    # Load model checkpoint (with normalization stats)
-    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
-    model = PriceGenGRU(
-        input_dim=int(ckpt["input_dim"]),
-        hidden_dim=int(ckpt["hidden_dim"]),
-        num_layers=int(ckpt["num_layers"]),
-        horizon=int(ckpt["horizon"]),
-    )
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-
-    x_mean = ckpt.get("x_mean")
-    x_std = ckpt.get("x_std")
-
-    # ---------------------------------------------------------
-    # Prepare seed window and feature index mapping
-    # ---------------------------------------------------------
     if X_all.shape[0] == 0:
         return {"status": "failed", "error": "Empty dataset X for generation."}
 
-    seed_window_raw = X_all[-1]  # [seq_len, feat_dim]
+    # Seed window is the last window in the dataset
+    seed_window_raw = X_all[-1]
     current_window_raw = seed_window_raw.copy()
+    seq_len, feat_dim = current_window_raw.shape
 
     # Feature indices for OHLCV
     open_idx = 0
@@ -302,12 +332,39 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
         close_idx = idx_map.get("close", close_idx)
         vol_idx = idx_map.get("volume", vol_idx)
 
-    # Create context rows (last window, before generation)
-    base_ts = seed_ts if seed_ts is not None else pd.Timestamp.now()
-    step_seconds = 15 if cfg.base_timeframe == "15s" else 60
+    # Model + normalization stats
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[run_generation] Using device: {device}")
 
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    model = PriceGenGRU(
+        input_dim=int(ckpt["input_dim"]),
+        hidden_dim=int(ckpt["hidden_dim"]),
+        num_layers=int(ckpt["num_layers"]),
+        horizon=int(ckpt["horizon"]),
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    x_mean = ckpt.get("x_mean", None)
+    x_std = ckpt.get("x_std", None)
+    tick_scale = float(ckpt.get("tick_scale", 1.0))
+    tick_size = float(ckpt.get("tick_size", TICK_SIZE))
+    vol_scale = float(ckpt.get("vol_scale", 1.0))
+
+    if not np.isfinite(tick_scale) or tick_scale < 0.5:
+        tick_scale = 1.0
+    if not np.isfinite(tick_size) or tick_size <= 0.0:
+        tick_size = TICK_SIZE
+    if not np.isfinite(vol_scale) or vol_scale < 1e-6:
+        vol_scale = 1.0
+
+    # Time handling: clean grid timestamps
+    step_seconds = 15 if cfg.base_timeframe == "15s" else 60
+    base_ts = pd.Timestamp.now().floor(f"{step_seconds}S")
+
+    # Context rows for plotting (seed window)
     context_rows = []
-    seq_len = current_window_raw.shape[0]
     for i in range(seq_len):
         row = current_window_raw[i]
         ts = base_ts - pd.Timedelta(seconds=step_seconds * (seq_len - i))
@@ -324,95 +381,85 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
         )
 
     last_ts = base_ts
-
-    # ---------------------------------------------------------
-    # Recursive Generation Logic with guard rails
-    # ---------------------------------------------------------
-    # Default: 4 hours of 15s candles = 960 steps (for 1m, this is 240 steps)
-    if cfg.base_timeframe == "15s":
-        num_steps = 4 * 60 * 4
-    else:
-        num_steps = 4 * 60  # 4 hours of 1m bars
-
     generated_rows = []
 
+    # 4 hours worth of steps
+    if cfg.base_timeframe == "15s":
+        num_steps = 4 * 60 * 4  # 960 steps
+    else:
+        num_steps = 4 * 60      # 240 steps for 1m
+
     for step in range(num_steps):
-        # Normalize current window
+        # Normalize current window with saved stats
         if x_mean is not None and x_std is not None:
             curr_win_norm = (current_window_raw - x_mean) / x_std
         else:
             curr_win_norm = current_window_raw
 
-        x_in = torch.from_numpy(curr_win_norm[None, :, :])  # [1, seq_len, feat_dim]
+        x_in = torch.from_numpy(curr_win_norm[None, :, :]).to(device)  # [1, seq_len, feat_dim]
         with torch.no_grad():
             pred = model(x_in)  # [1, horizon, 5]
 
-        pred_vals = pred[0, 0].numpy()  # [5]
+        pred_vals = pred[0, 0].cpu().numpy()  # [5]
 
         last_close = float(current_window_raw[-1, close_idx])
         last_vol = float(current_window_raw[-1, vol_idx])
 
-        # If last_close or last_vol are degenerate, bail out
-        if not np.isfinite(last_close) or abs(last_close) < 1e-6:
+        if not np.isfinite(last_close):
             print("[run_generation] Aborting: invalid last_close.")
             break
         if not np.isfinite(last_vol):
             last_vol = 0.0
 
-        # Clamp returns to avoid explosions / death spiral
-        max_ret = 0.01   # max +/- 1% per step
-        delta_o = float(np.clip(pred_vals[0], -max_ret, max_ret))
-        delta_h = float(np.clip(pred_vals[1], -max_ret, max_ret))
-        delta_l = float(np.clip(pred_vals[2], -max_ret, max_ret))
-        delta_c = float(np.clip(pred_vals[3], -max_ret, max_ret))
+        # Denormalize to tick deltas
+        delta_ticks_o = float(pred_vals[0]) * tick_scale
+        delta_ticks_h = float(pred_vals[1]) * tick_scale
+        delta_ticks_l = float(pred_vals[2]) * tick_scale
+        delta_ticks_c = float(pred_vals[3]) * tick_scale
+        delta_v = float(pred_vals[4]) * vol_scale
 
-        max_vol_change = 1.0  # +/- 100% per step in volume change ratio
-        delta_v = float(np.clip(pred_vals[4], -max_vol_change, max_vol_change))
+        # Convert tick deltas to price deltas
+        delta_o = delta_ticks_o * tick_size
+        delta_h = delta_ticks_h * tick_size
+        delta_l = delta_ticks_l * tick_size
+        delta_c = delta_ticks_c * tick_size
 
-        # Convert returns back to levels
-        next_o = last_close * (1.0 + delta_o)
-        next_h = last_close * (1.0 + delta_h)
-        next_l = last_close * (1.0 + delta_l)
-        next_c = last_close * (1.0 + delta_c)
-        next_v = last_vol + delta_v * (last_vol + 1.0)
+        # Compute next OHLCV in price space
+        next_o = last_close + delta_o
+        next_h = last_close + delta_h
+        next_l = last_close + delta_l
+        next_c = last_close + delta_c
+        next_v = last_vol + delta_v
 
-        # Sanity checks
-        if not all(np.isfinite([next_o, next_h, next_l, next_c, next_v])):
+        vals = [next_o, next_h, next_l, next_c, next_v]
+        if not all(np.isfinite(vals)):
             print(f"[run_generation] Aborting: non-finite next values at step {step}.")
             break
 
-        # Reject absurd magnitudes
-        if abs(next_c) > 1e5:
+        # Reject absurd close magnitudes
+        if abs(next_c) > 1e6:
             print(f"[run_generation] Aborting: close magnitude too large at step {step}: {next_c}")
             break
 
-        # Price jump guard: if > 3% move in a single step, bail
-        price_jump = abs(next_c / last_close - 1.0)
-        if price_jump > 0.03:
-            print(
-                f"[run_generation] Aborting: close jump {price_jump:.2%} "
-                f"from {last_close} to {next_c} at step {step}."
-            )
-            break
+        # Snap to tick grid and integer volume
+        next_o = round_to_tick(next_o, tick_size)
+        next_h = round_to_tick(next_h, tick_size)
+        next_l = round_to_tick(next_l, tick_size)
+        next_c = round_to_tick(next_c, tick_size)
+        next_v = round_volume(next_v)
 
-        # Volume cannot be negative
-        next_v = max(0.0, next_v)
-
-        # Repair OHLC consistency
+        # Repair OHLC consistency AFTER snapping
         next_o, next_h, next_l, next_c = repair_ohlc(next_o, next_h, next_l, next_c)
 
-        # Build new feature row
-        next_row_vals = np.array([next_o, next_h, next_l, next_c, next_v], dtype=np.float32)
-
+        # Build next feature row by copying last and overriding OHLCV
         next_full_row = np.array(current_window_raw[-1], copy=True)
-        next_full_row[open_idx] = next_row_vals[0]
-        next_full_row[high_idx] = next_row_vals[1]
-        next_full_row[low_idx] = next_row_vals[2]
-        next_full_row[close_idx] = next_row_vals[3]
-        next_full_row[vol_idx] = next_row_vals[4]
-        # NOTE: other indicator features are left as-is from previous step for now.
+        next_full_row[open_idx] = next_o
+        next_full_row[high_idx] = next_h
+        next_full_row[low_idx] = next_l
+        next_full_row[close_idx] = next_c
+        next_full_row[vol_idx] = float(next_v)
 
-        # Update window
+        # Slide window
         current_window_raw = np.vstack([current_window_raw[1:], next_full_row])
 
         last_ts = last_ts + pd.Timedelta(seconds=step_seconds)
@@ -429,7 +476,6 @@ def run_generation(cfg: ExperimentConfig, dataset_path: Path, model_path: Path, 
         )
 
     full_df = pd.DataFrame(context_rows + generated_rows)
-
     out_csv = run_dir / "generated_sequence.csv"
     full_df.to_csv(out_csv, index=False)
 
@@ -464,9 +510,7 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
     gen_info: Dict[str, Any] = {"status": "skipped"}
     metrics_info: Dict[str, Any] = {"status": "stub"}
 
-    # --------------------------------------------------------
     # PHASE 1 — Dataset compilation
-    # --------------------------------------------------------
     t0 = time.time()
     if cfg.experiment_kind == "bars_multi_tf":
         try:
@@ -477,9 +521,7 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
         dataset_info = {"note": f"experiment_kind={cfg.experiment_kind!r} not implemented"}
     phases["compile_dataset"] = time.time() - t0
 
-    # --------------------------------------------------------
     # PHASE 2 — Train
-    # --------------------------------------------------------
     t1 = time.time()
     dataset_path = dataset_info.get("dataset_path")
     if dataset_path:
@@ -489,9 +531,7 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
             train_info = {"status": "failed", "error": str(e)}
     phases["train"] = time.time() - t1
 
-    # --------------------------------------------------------
     # PHASE 3 — Generate
-    # --------------------------------------------------------
     t2 = time.time()
     model_path = train_info.get("best_model_path")
     if model_path and dataset_path:
@@ -501,9 +541,14 @@ def run_experiment(cfg: ExperimentConfig) -> Dict[str, Any]:
             gen_info = {"status": "failed", "error": str(e)}
     phases["generate"] = time.time() - t2
 
-    # --------------------------------------------------------
+    # PHASE 3.5 — Plot chart
+    if gen_info.get("status") == "success":
+        try:
+            plot_model_result(run_dir)
+        except Exception as e:
+            print(f"[run_experiment] plot_model_result failed: {e}")
+
     # PHASE 4 — Metrics (stub)
-    # --------------------------------------------------------
     t3 = time.time()
     phases["metrics"] = time.time() - t3
 
@@ -546,7 +591,10 @@ if __name__ == "__main__":
         name=f"manual_test_{ts}",
         sweep_id="manual_test",
         out_dir=test_run,
-        epochs=2,
+        epochs=5,
+        hidden_size=64,
+        num_layers=1,
+        batch_size=128,
     )
     info = run_experiment(cfg)
     print("[run_experiment.__main__] Finished:", info)
